@@ -11,14 +11,9 @@ The agent connects to:
   http://mcp-server.tenant-acme:8080/mcp   ← direct mcp-server (bypasses policy)
 
 Usage:
-  # Port-forwarded locally:
   kubectl port-forward -n tenant-acme svc/mcp-server 8090:8090
   python agent_client.py
 
-  # With custom env:
-  PROXY_URL=http://localhost:8090 AGENT_ID=sre-agent python agent_client.py
-
-  # Single scenario:
   python agent_client.py --single list-pods
   python agent_client.py --single delete-pod
   python agent_client.py --single cross-tenant
@@ -42,7 +37,7 @@ async def mcp_call(
     tool_name:    str,
     arguments:    dict,
     reason:       str = "",
-    triggered_by: str | None = None,   # override per-call (used in Scenario 4)
+    triggered_by: str | None = None,
 ) -> dict:
     """
     Send a tools/call JSON-RPC request to the authz-proxy.
@@ -80,7 +75,7 @@ async def mcp_call(
         except httpx.ConnectError:
             return {"error": {"message": f"Cannot connect to proxy at {PROXY_URL}. Is port-forward running?"}}
         except httpx.TimeoutException:
-            return {"error": {"message": f"Request timed out after 15s"}}
+            return {"error": {"message": "Request timed out after 15s"}}
 
 
 # ── Pretty printer ────────────────────────────────────────────────────────────
@@ -92,7 +87,6 @@ def print_result(scenario: str, tool: str, result: dict):
 
     if "error" in result:
         msg = result["error"]
-        # httpx errors come as plain string, Kyverno errors as dict
         if isinstance(msg, dict):
             msg = msg.get("message", str(msg))
 
@@ -130,23 +124,23 @@ async def run_demo():
     print("▶ Connected to authz-proxy. Running 4 scenarios...\n")
 
     # ── Scenario 1: ALLOWED ───────────────────────────────────────────────────
-    # sre-agent lists pods in its own tenant — allowlist passes, tenant matches
-    print("  [1/4] SRE lists pods in own tenant")
+    # sre-agent lists pods in own namespace — in allowlist, tenant matches
+    print("  [1/4] SRE lists pods in own namespace")
     result = await mcp_call(
-        tool_name="pods_list",
+        tool_name="pods_list_in_namespace",
         arguments={"namespace": "tenant-acme"},
         reason="SRE checking pod status for incident investigation",
     )
     print_result(
-        "✅ SRE lists pods in own tenant",
-        "pods_list",
+        "✅ SRE lists pods in own namespace",
+        "pods_list_in_namespace",
         result,
     )
 
     await asyncio.sleep(0.5)
 
     # ── Scenario 2: DENIED — tool not in allowlist ────────────────────────────
-    # sre-agent tries pods_delete — not in its allowlist (only remediation-agent can delete)
+    # sre-agent tries pods_delete — only remediation-agent can delete
     print("\n  [2/4] SRE tries to delete a pod")
     result = await mcp_call(
         tool_name="pods_delete",
@@ -154,7 +148,7 @@ async def run_demo():
         reason="SRE trying to remove a crashed pod",
     )
     print_result(
-        "❌ SRE tries to delete pod (not in allowlist)",
+        "❌ SRE tries pods_delete (not in allowlist)",
         "pods_delete",
         result,
     )
@@ -163,51 +157,56 @@ async def run_demo():
 
     # ── Scenario 3: DENIED — cross-tenant ────────────────────────────────────
     # sre-agent in tenant-acme queries tenant-globex namespace
-    # Policy 02 (tenant-isolation): tenantId must match the CR namespace
+    # Policy 02: tenantId must match the CR namespace
     print("\n  [3/4] SRE queries a different tenant's namespace")
     result = await mcp_call(
-        tool_name="pods_list",
+        tool_name="pods_list_in_namespace",
         arguments={"namespace": "tenant-globex"},
         reason="Accidentally querying wrong namespace",
     )
     print_result(
         "❌ SRE queries tenant-globex (cross-tenant blocked)",
-        "pods_list  namespace=tenant-globex",
+        "pods_list_in_namespace  namespace=tenant-globex",
         result,
     )
 
     await asyncio.sleep(0.5)
 
-    # ── Scenario 4: DENIED — write tool, no human trigger ────────────────────
-    # triggered_by="" passed explicitly — simulates an autonomous agent
-    # Policy 3b: write tools require non-empty triggeredBy
+    # ── Scenario 4: DENIED — write tool without human trigger ────────────────
+    # resources_scale is a write tool — requires triggeredBy (Policy 3b)
+    # triggered_by="" explicitly simulates autonomous agent
     print("\n  [4/4] Autonomous agent calls a write tool (no human trigger)")
     result = await mcp_call(
-        tool_name="scale_deployment",
-        arguments={"name": "checkout", "namespace": "tenant-acme", "replicas": 5},
+        tool_name="resources_scale",
+        arguments={
+            "apiVersion": "apps/v1",
+            "kind":       "Deployment",
+            "name":       "checkout",
+            "namespace":  "tenant-acme",
+            "replicas":   5,
+        },
         reason="Auto-scaling triggered by metric alert",
-        triggered_by="",           # ← explicitly empty, overrides global TRIGGERED_BY
+        triggered_by="",
     )
     print_result(
         "❌ Write tool with no human trigger",
-        "scale_deployment  (triggered_by=empty)",
+        "resources_scale  (triggered_by=empty)",
         result,
     )
 
     # ── Scenario 5 hint ──────────────────────────────────────────────────────
     print(f"\n{'─' * 60}")
-    print("  Scenario 5 — remediation-agent with full human context")
-    print("  Run separately:")
+    print("  Scenario 5 — remediation-agent with human approval:")
     print("    AGENT_ID=remediation-agent TRIGGERED_BY=bob@acme.com \\")
     print("    python agent_client.py --single scale")
     print(f"{'─' * 60}")
 
     print("\n✅ Demo complete.\n")
     print("  Individual scenarios:")
-    print("    python agent_client.py --single list-pods")
-    print("    python agent_client.py --single delete-pod")
-    print("    python agent_client.py --single cross-tenant")
-    print("    python agent_client.py --single scale-no-human")
+    print("    python agent/agent_client.py --single list-pods")
+    print("    python agent/agent_client.py --single delete-pod")
+    print("    python agent/agent_client.py --single cross-tenant")
+    print("    python agent/agent_client.py --single scale-no-human")
     print("    AGENT_ID=remediation-agent TRIGGERED_BY=bob@acme.com \\")
     print("    python agent_client.py --single scale")
     print()
@@ -217,32 +216,61 @@ async def run_demo():
 
 async def run_single(scenario: str):
     scenarios = {
+        # ✅ sre-agent reads pods in own namespace — ALLOWED
         "list-pods": lambda: mcp_call(
-            "pods_list",
+            "pods_list_in_namespace",
             {"namespace": "tenant-acme"},
             "Checking pod status",
         ),
+        # ❌ sre-agent tries delete — not in allowlist
         "delete-pod": lambda: mcp_call(
             "pods_delete",
             {"name": "checkout-abc", "namespace": "tenant-acme"},
             "Deleting crashed pod",
         ),
+        # ❌ sre-agent queries tenant-globex — cross-tenant blocked
         "cross-tenant": lambda: mcp_call(
-            "pods_list",
+            "pods_list_in_namespace",
             {"namespace": "tenant-globex"},
             "Cross-tenant query",
         ),
+        # ❌ resources_scale without human trigger — Policy 3b blocks
         "scale-no-human": lambda: mcp_call(
-            "scale_deployment",
-            {"name": "checkout", "namespace": "tenant-acme", "replicas": 3},
-            "Autonomous scale",
-            triggered_by="",       # ← no human, should be denied
+            "resources_scale",
+            {
+                "apiVersion": "apps/v1",
+                "kind":       "Deployment",
+                "name":       "checkout",
+                "namespace":  "tenant-acme",
+                "replicas":   3,
+            },
+            "Autonomous scale attempt",
+            triggered_by="",
         ),
+        # ✅ remediation-agent + human trigger — ALLOWED
+        # Run as: AGENT_ID=remediation-agent TRIGGERED_BY=bob@acme.com python agent_client.py --single scale
         "scale": lambda: mcp_call(
-            "scale_deployment",
-            {"name": "checkout", "namespace": "tenant-acme", "replicas": 3},
+            "resources_scale",
+            {
+                "apiVersion": "apps/v1",
+                "kind":       "Deployment",
+                "name":       "checkout",
+                "namespace":  "tenant-acme",
+                "replicas":   3,
+            },
             "Human-approved scale",
-            # triggered_by uses global TRIGGERED_BY (set via env var)
+        ),
+        # ✅ sre-agent reads pod logs — ALLOWED
+        "logs": lambda: mcp_call(
+            "pods_log",
+            {"name": "checkout-abc", "namespace": "tenant-acme"},
+            "Checking logs for error",
+        ),
+        # ✅ sre-agent lists events — ALLOWED
+        "events": lambda: mcp_call(
+            "events_list",
+            {},
+            "Listing cluster events",
         ),
     }
 

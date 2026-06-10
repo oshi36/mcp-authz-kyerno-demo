@@ -1,10 +1,13 @@
 # ──────────────────────────────────────────────────────────────────────────────
 # Policy 1: Tool Allowlist per Agent Identity
-# API: policies.kyverno.io/v1 / ValidatingPolicy  (ClusterPolicy is deprecated)
+# API: policies.kyverno.io/v1 / ValidatingPolicy
 #
-# Restricts which MCP tools each agent ServiceAccount is permitted to invoke.
-# Deny-by-default: agents must be explicitly listed with their allowed tools.
-# Uses CEL expressions — no JMESPath.
+# Real tool names from containers/kubernetes-mcp-server (19 tools):
+#   configuration_view, events_list, namespaces_list, nodes_log,
+#   nodes_stats_summary, nodes_top, pods_delete, pods_exec, pods_get,
+#   pods_list, pods_list_in_namespace, pods_log, pods_run, pods_top,
+#   resources_create_or_update, resources_delete, resources_get,
+#   resources_list, resources_scale
 # ──────────────────────────────────────────────────────────────────────────────
 apiVersion: policies.kyverno.io/v1
 kind: ValidatingPolicy
@@ -16,11 +19,11 @@ metadata:
     policies.kyverno.io/severity: high
     policies.kyverno.io/description: >-
       Enforces per-agent tool allowlists for MCP tool invocations.
-      Each agent ServiceAccount is restricted to a defined set of tools.
+      Each agent is restricted to a defined set of tools via spec.agentId.
       Any invocation outside the allowlist is denied at admission.
 spec:
   validationActions:
-    - Deny   # change to Audit during initial rollout, flip to Deny after 2 weeks
+    - Deny
   matchConstraints:
     resourceRules:
       - apiGroups:   ["mcp.security.io"]
@@ -28,30 +31,71 @@ spec:
         operations:  ["CREATE"]
         resources:   ["mcptoolinvocations"]
   validations:
-    # ── SRE Agent allowlist ───────────────────────────────────────────────────
+
+    # ── Require agentId ───────────────────────────────────────────────────────
     - expression: >-
-        !(request.userInfo.username == "system:serviceaccount:agents:sre-agent") ||
-        object.spec.toolName in ["query_metrics", "list_incidents", "get_runbook", "check_slo"]
+        has(object.spec.agentId) && object.spec.agentId != ""
+      message: >-
+        MCPToolInvocation must include a non-empty agentId in spec.
+
+    # ── SRE Agent — read-only observability tools ─────────────────────────────
+    # Low risk: can list, get, and read logs. No writes, no exec, no deletes.
+    - expression: >-
+        !(object.spec.agentId == "sre-agent") ||
+        object.spec.toolName in [
+          "pods_list",
+          "pods_list_in_namespace",
+          "pods_get",
+          "pods_log",
+          "pods_top",
+          "events_list",
+          "namespaces_list",
+          "nodes_top",
+          "configuration_view"
+        ]
       messageExpression: >-
         "sre-agent is not permitted to invoke '" + object.spec.toolName + "'. " +
-        "Allowed tools: query_metrics, list_incidents, get_runbook, check_slo"
+        "Allowed tools: pods_list, pods_list_in_namespace, pods_get, pods_log, " +
+        "pods_top, events_list, namespaces_list, nodes_top, configuration_view"
 
-    # ── Cost Agent allowlist ──────────────────────────────────────────────────
+    # ── Cost Agent — resource usage and billing reads ─────────────────────────
+    # Low risk: reads only resource metrics and billing data.
     - expression: >-
-        !(request.userInfo.username == "system:serviceaccount:agents:cost-agent") ||
+        !(object.spec.agentId == "cost-agent") ||
         object.spec.toolName in [
-          "get_resource_usage",
-          "list_rightsizing_recommendations",
-          "get_billing_summary"
+          "nodes_stats_summary",
+          "nodes_top",
+          "nodes_log",
+          "pods_top",
+          "resources_list",
+          "resources_get"
         ]
       messageExpression: >-
         "cost-agent is not permitted to invoke '" + object.spec.toolName + "'. " +
-        "Allowed tools: get_resource_usage, list_rightsizing_recommendations, get_billing_summary"
+        "Allowed tools: nodes_stats_summary, nodes_top, nodes_log, " +
+        "pods_top, resources_list, resources_get"
 
-    # ── Remediation Agent allowlist ───────────────────────────────────────────
+    # ── Remediation Agent — write tools (require human trigger via Policy 3b) ─
+    # High risk: can delete, exec, scale, and create resources.
+    # Policy 3b enforces that all these require a human triggeredBy field.
     - expression: >-
-        !(request.userInfo.username == "system:serviceaccount:agents:remediation-agent") ||
-        object.spec.toolName in ["restart_pod", "scale_deployment", "rollback_deployment"]
+        !(object.spec.agentId == "remediation-agent") ||
+        object.spec.toolName in [
+          "pods_delete",
+          "pods_exec",
+          "pods_run",
+          "resources_scale",
+          "resources_create_or_update",
+          "resources_delete"
+        ]
       messageExpression: >-
         "remediation-agent is not permitted to invoke '" + object.spec.toolName + "'. " +
-        "Allowed tools: restart_pod, scale_deployment, rollback_deployment"
+        "Allowed tools: pods_delete, pods_exec, pods_run, " +
+        "resources_scale, resources_create_or_update, resources_delete"
+
+    # ── Unknown agent — deny by default ──────────────────────────────────────
+    - expression: >-
+        object.spec.agentId in ["sre-agent", "cost-agent", "remediation-agent"]
+      messageExpression: >-
+        "Unknown agent '" + object.spec.agentId + "' is not registered. " +
+        "Permitted agents: sre-agent, cost-agent, remediation-agent"

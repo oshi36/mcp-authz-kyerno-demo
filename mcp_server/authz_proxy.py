@@ -108,8 +108,10 @@ def create_invocation_cr(tool_name: str, params: dict, triggered_by: str, reason
         return {"admitted": True, "name": name, "cr": result}
 
     except client.ApiException as e:
-        if e.status in (403, 422):
-            # Kyverno denied at admission — extract policy message
+        # 400 — Kyverno ValidatingPolicy (policies.kyverno.io/v1) denial
+        # 403 — Kyverno ClusterPolicy (kyverno.io/v1) denial
+        # 422 — Unprocessable entity (validation failure)
+        if e.status in (400, 403, 422):
             body_json = json.loads(e.body) if e.body else {}
             message = (
                 body_json.get("message", "")

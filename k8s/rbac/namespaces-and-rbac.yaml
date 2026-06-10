@@ -1,6 +1,5 @@
 ---
 # Tenant namespaces — each tenant gets its own namespace
-# This is the foundation of the multi-tenant isolation model
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -8,7 +7,6 @@ metadata:
   labels:
     mcp.security.io/tenant: "true"
     tenant-id: acme
-
 ---
 apiVersion: v1
 kind: Namespace
@@ -17,7 +15,6 @@ metadata:
   labels:
     mcp.security.io/tenant: "true"
     tenant-id: globex
-
 ---
 # Shared agents namespace — where the agent ServiceAccounts live
 apiVersion: v1
@@ -27,8 +24,9 @@ metadata:
   labels:
     mcp.security.io/agents: "true"
 
+# ── Agent ServiceAccounts ─────────────────────────────────────────────────────
+
 ---
-# SRE Agent ServiceAccount
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -37,9 +35,7 @@ metadata:
   labels:
     mcp.security.io/agent-type: observability
     mcp.security.io/risk-level: low
-
 ---
-# Cost Agent ServiceAccount
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -48,9 +44,7 @@ metadata:
   labels:
     mcp.security.io/agent-type: cost-optimization
     mcp.security.io/risk-level: low
-
 ---
-# Remediation Agent ServiceAccount
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -60,8 +54,32 @@ metadata:
     mcp.security.io/agent-type: remediation
     mcp.security.io/risk-level: high
 
+# ── MCP Server ServiceAccounts (one per tenant) ───────────────────────────────
+# These SAs are used by the kubernetes-mcp-server + authz-proxy pod.
+# They need K8s API permissions to execute tool calls (pods_list etc.)
+
 ---
-# ClusterRole: permission to create MCPToolInvocations (all agents need this)
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: mcp-server
+  namespace: tenant-acme
+  labels:
+    mcp.security.io/component: mcp-server
+    tenant-id: acme
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: mcp-server
+  namespace: tenant-globex
+  labels:
+    mcp.security.io/component: mcp-server
+    tenant-id: globex
+
+# ── ClusterRole: agents create MCPToolInvocations ─────────────────────────────
+
+---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -70,9 +88,8 @@ rules:
   - apiGroups: ["mcp.security.io"]
     resources: ["mcptoolinvocations"]
     verbs: ["create", "get", "list", "watch"]
-
 ---
-# Bind all agent ServiceAccounts to the invocation creator role
+# Bind all agent SAs to invocation creator role
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
@@ -91,3 +108,65 @@ subjects:
   - kind: ServiceAccount
     name: remediation-agent
     namespace: agents
+
+# ── ClusterRole: mcp-server executes K8s operations ──────────────────────────
+# kubernetes-mcp-server needs these to actually run tool calls.
+# Intentionally broad — Kyverno policies are the enforcement layer on top.
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: mcp-server-operator
+rules:
+  # Core resources — pods, services, configmaps, namespaces
+  - apiGroups: [""]
+    resources: ["pods", "pods/log", "pods/exec"]
+    verbs: ["get", "list", "watch", "delete"]
+  - apiGroups: [""]
+    resources: ["services", "endpoints", "configmaps", "events"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["namespaces", "nodes"]
+    verbs: ["get", "list"]
+  # Apps — deployments, replicasets, statefulsets
+  - apiGroups: ["apps"]
+    resources: ["deployments", "replicasets", "statefulsets", "daemonsets"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+  # MCPToolInvocations — proxy needs to create CRs
+  - apiGroups: ["mcp.security.io"]
+    resources: ["mcptoolinvocations"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+  # Kyverno policies — dashboard reads these
+  - apiGroups: ["kyverno.io", "policies.kyverno.io"]
+    resources: ["clusterpolicies", "validatingpolicies", "mutatingpolicies"]
+    verbs: ["get", "list"]
+
+---
+# Bind mcp-server SA in tenant-acme
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: mcp-server-tenant-acme-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: mcp-server-operator
+subjects:
+  - kind: ServiceAccount
+    name: mcp-server
+    namespace: tenant-acme
+---
+# Bind mcp-server SA in tenant-globex
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: mcp-server-tenant-globex-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: mcp-server-operator
+subjects:
+  - kind: ServiceAccount
+    name: mcp-server
+    namespace: tenant-globex
