@@ -183,7 +183,7 @@ async def run_demo():
             "kind":       "Deployment",
             "name":       "checkout",
             "namespace":  "tenant-acme",
-            "replicas":   5,
+            "scale":      5,              # ← correct param name
         },
         reason="Auto-scaling triggered by metric alert",
         triggered_by="",
@@ -203,10 +203,10 @@ async def run_demo():
 
     print("\n✅ Demo complete.\n")
     print("  Individual scenarios:")
-    print("    python agent/agent_client.py --single list-pods")
-    print("    python agent/agent_client.py --single delete-pod")
-    print("    python agent/agent_client.py --single cross-tenant")
-    print("    python agent/agent_client.py --single scale-no-human")
+    print("    python agent_client.py --single list-pods")
+    print("    python agent_client.py --single delete-pod")
+    print("    python agent_client.py --single cross-tenant")
+    print("    python agent_client.py --single scale-no-human")
     print("    AGENT_ID=remediation-agent TRIGGERED_BY=bob@acme.com \\")
     print("    python agent_client.py --single scale")
     print()
@@ -242,7 +242,7 @@ async def run_single(scenario: str):
                 "kind":       "Deployment",
                 "name":       "checkout",
                 "namespace":  "tenant-acme",
-                "replicas":   3,
+                "scale":      5,            # ← correct param name
             },
             "Autonomous scale attempt",
             triggered_by="",
@@ -256,7 +256,7 @@ async def run_single(scenario: str):
                 "kind":       "Deployment",
                 "name":       "checkout",
                 "namespace":  "tenant-acme",
-                "replicas":   3,
+                "scale":      3,            # ← correct param name
             },
             "Human-approved scale",
         ),
