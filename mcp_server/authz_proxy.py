@@ -63,7 +63,8 @@ def create_invocation_cr(
     params:       dict,
     triggered_by: str,
     reason:       str,
-    agent_id:     str = None,   # from x-agent-id header; falls back to AGENT_ID env
+    agent_id:     str = None,
+    tenant_id:    str = None,   # explicit tenant from x-tenant-id header
 ) -> dict:
     """
     Create an MCPToolInvocation CR and let Kyverno evaluate it.
@@ -75,6 +76,16 @@ def create_invocation_cr(
 
     effective_agent_id = agent_id or AGENT_ID
 
+    # Tenant detection priority:
+    # 1. tenant_id param (from x-tenant-id header — explicit override)
+    # 2. params.namespace (auto-detect cross-namespace tool calls)
+    # 3. TENANT_ID env var (default — same tenant)
+    if tenant_id and tenant_id != TENANT_ID:
+        effective_tenant_id = tenant_id
+    else:
+        target_ns = params.get("namespace", "")
+        effective_tenant_id = target_ns if (target_ns and target_ns != TENANT_ID) else TENANT_ID
+
     custom_api = client.CustomObjectsApi()
     name = f"proxy-{tool_name.replace('_', '-')}-{uuid.uuid4().hex[:6]}"
 
@@ -84,7 +95,7 @@ def create_invocation_cr(
         "metadata": {
             "name":      name,
             "namespace": TENANT_ID,
-            "annotations": {},          # ← initialize so MutatingPolicy can add keys
+            "annotations": {},
             "labels": {
                 "mcp.security.io/agent-id":  effective_agent_id,
                 "mcp.security.io/tool-name": tool_name,
@@ -93,7 +104,7 @@ def create_invocation_cr(
         "spec": {
             "toolName":    tool_name,
             "agentId":     effective_agent_id,
-            "tenantId":    TENANT_ID,
+            "tenantId":    effective_tenant_id,   # ← target namespace, not always TENANT_ID
             "triggeredBy": triggered_by,
             "reason":      reason,
             "parameters":  params,
@@ -152,16 +163,16 @@ async def proxy_mcp_post(request: Request):
     tool_args    = params.get("arguments", {})
     triggered_by = request.headers.get("x-triggered-by", "")
     reason       = request.headers.get("x-reason", "")
-    # Agent identity from header — allows switching agents without pod restart
     agent_id     = request.headers.get("x-agent-id", AGENT_ID)
+    tenant_id    = request.headers.get("x-tenant-id", "")   # explicit tenant override
 
     log.info(
         f"Intercepted: tool={tool_name}  agent={agent_id}  "
-        f"tenant={TENANT_ID}  triggered_by='{triggered_by}'"
+        f"tenant={tenant_id or TENANT_ID}  triggered_by='{triggered_by}'"
     )
 
     # Create CR — Kyverno admission webhook fires here
-    cr_result = create_invocation_cr(tool_name, tool_args, triggered_by, reason, agent_id)
+    cr_result = create_invocation_cr(tool_name, tool_args, triggered_by, reason, agent_id, tenant_id)
 
     if not cr_result.get("admitted") and not cr_result.get("simulated"):
         policy_msg = cr_result.get("reason", "Tool invocation denied by policy")

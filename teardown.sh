@@ -82,6 +82,6 @@ echo "╔═══════════════════════�
 echo "║   ✅ Teardown complete!                                  ║"
 echo "║                                                          ║"
 echo "║  All demo resources have been removed.                   ║"
-echo "║  Re-run bootstrap.sh to set up the stack again.         ║"
+echo "║  Re-run setup.sh to set up the stack again.         ║"
 echo "╚══════════════════════════════════════════════════════════╝"
 echo ""

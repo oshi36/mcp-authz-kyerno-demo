@@ -3,25 +3,44 @@ MCP AuthZ Demo — Policy-Driven Tool Invocation Control
 Talk: Closing the AuthZ Gap in MCP
 Speaker: Oshi (InfraCloud Technologies / Improving)
 
-Flask app that simulates MCP tool invocations and shows Kyverno policy
-enforcement in real-time. Designed for live demo during talk.
+Flask app that makes REAL MCP tool calls via the authz-proxy
+and shows actual Kyverno policy enforcement in real-time.
+No simulation — every invocation goes through the real proxy.
 """
 
 from flask import Flask, render_template, request, jsonify
 import json
 import time
 import datetime
-import subprocess
 import os
-import yaml
+import re
+import requests as req
+
+# Optional: Kubernetes client for reading live CRs
+try:
+    from kubernetes import client, config as k8s_config
+    try:
+        k8s_config.load_incluster_config()
+        K8S_AVAILABLE = True
+    except Exception:
+        try:
+            k8s_config.load_kube_config()
+            K8S_AVAILABLE = True
+        except Exception:
+            K8S_AVAILABLE = False
+except ImportError:
+    K8S_AVAILABLE = False
 
 app = Flask(__name__)
 
-# ──────────────────────────────────────────────
-# Agent definitions — real tool names from
-# containers/kubernetes-mcp-server (19 tools)
-# ──────────────────────────────────────────────
+# ── Config ─────────────────────────────────────────────────────────────────────
+PROXY_URL  = os.environ.get("PROXY_URL",  "http://localhost:8090")
+TENANT_ID  = os.environ.get("TENANT_ID",  "tenant-acme")
+MCP_GROUP  = "mcp.security.io"
+MCP_VERSION = "v1alpha1"
+MCP_PLURAL = "mcptoolinvocations"
 
+# ── Agent definitions ──────────────────────────────────────────────────────────
 AGENTS = {
     "sre-agent": {
         "label": "SRE Agent",
@@ -30,15 +49,9 @@ AGENTS = {
         "icon": "ti-activity",
         "color": "blue",
         "allowed_tools": [
-            "pods_list",
-            "pods_list_in_namespace",
-            "pods_get",
-            "pods_log",
-            "pods_top",
-            "events_list",
-            "namespaces_list",
-            "nodes_top",
-            "configuration_view",
+            "pods_list", "pods_list_in_namespace", "pods_get",
+            "pods_log", "pods_top", "events_list",
+            "namespaces_list", "nodes_top", "configuration_view",
         ],
     },
     "cost-agent": {
@@ -48,12 +61,8 @@ AGENTS = {
         "icon": "ti-chart-bar",
         "color": "green",
         "allowed_tools": [
-            "nodes_stats_summary",
-            "nodes_top",
-            "nodes_log",
-            "pods_top",
-            "resources_list",
-            "resources_get",
+            "nodes_stats_summary", "nodes_top", "nodes_log",
+            "pods_top", "resources_list", "resources_get",
         ],
     },
     "remediation-agent": {
@@ -63,21 +72,16 @@ AGENTS = {
         "icon": "ti-tool",
         "color": "amber",
         "allowed_tools": [
-            "pods_delete",
-            "pods_exec",
-            "pods_run",
-            "resources_scale",
-            "resources_create_or_update",
-            "resources_delete",
+            "pods_delete", "pods_exec", "pods_run",
+            "resources_scale", "resources_create_or_update", "resources_delete",
         ],
     },
 }
 
 TENANTS = ["tenant-acme", "tenant-globex"]
 
-# Real 19 tools from containers/kubernetes-mcp-server
 ALL_TOOLS = [
-    # ── Observability (sre-agent) ──────────────────────────────────────────
+    # Observability
     {"name": "pods_list",              "category": "observability", "write": False},
     {"name": "pods_list_in_namespace", "category": "observability", "write": False},
     {"name": "pods_get",               "category": "observability", "write": False},
@@ -87,12 +91,12 @@ ALL_TOOLS = [
     {"name": "namespaces_list",        "category": "observability", "write": False},
     {"name": "nodes_top",              "category": "observability", "write": False},
     {"name": "configuration_view",     "category": "observability", "write": False},
-    # ── Cost (cost-agent) ─────────────────────────────────────────────────
+    # Cost
     {"name": "nodes_stats_summary",    "category": "cost",          "write": False},
     {"name": "nodes_log",              "category": "cost",          "write": False},
     {"name": "resources_list",         "category": "cost",          "write": False},
     {"name": "resources_get",          "category": "cost",          "write": False},
-    # ── Remediation (remediation-agent) — write tools ─────────────────────
+    # Remediation (write)
     {"name": "pods_delete",            "category": "remediation",   "write": True},
     {"name": "pods_exec",              "category": "remediation",   "write": True},
     {"name": "pods_run",               "category": "remediation",   "write": True},
@@ -103,86 +107,235 @@ ALL_TOOLS = [
 
 WRITE_TOOLS = [t["name"] for t in ALL_TOOLS if t["write"]]
 
-# ──────────────────────────────────────────────
-# Policy engine (simulated for demo)
-# In real deployment this is Kyverno admission webhook
-# ──────────────────────────────────────────────
+SCENARIOS = [
+    {
+        "id": "allowed-sre-pods",
+        "label": "✅ SRE lists pods in own namespace",
+        "description": "SRE agent lists pods in tenant-acme. All policies pass.",
+        "invocation": {
+            "agentId": "sre-agent", "toolName": "pods_list_in_namespace",
+            "namespace": "tenant-acme", "tenantId": "tenant-acme",
+            "triggeredBy": "alice@acme.com",
+            "reason": "Checking pod status during incident investigation",
+            "parameters": {"namespace": "tenant-acme"},
+        },
+    },
+    {
+        "id": "denied-tool-allowlist",
+        "label": "❌ SRE tries to scale deployment (not in allowlist)",
+        "description": "SRE agent calls resources_scale — not in its allowlist. Policy 1 blocks.",
+        "invocation": {
+            "agentId": "sre-agent", "toolName": "resources_scale",
+            "namespace": "tenant-acme", "tenantId": "tenant-acme",
+            "triggeredBy": "alice@acme.com",
+            "reason": "Trying to scale after seeing high latency",
+            "parameters": {"apiVersion": "apps/v1", "kind": "Deployment",
+                          "name": "nginx", "namespace": "tenant-acme", "scale": 5},
+        },
+    },
+    {
+        "id": "denied-cross-tenant",
+        "label": "❌ SRE crosses tenant boundary",
+        "description": "SRE in tenant-acme tries listing pods in tenant-globex. Policy 2 blocks.",
+        "invocation": {
+            "agentId": "sre-agent", "toolName": "pods_list_in_namespace",
+            "namespace": "tenant-acme", "tenantId": "tenant-globex",
+            "triggeredBy": "alice@acme.com",
+            "reason": "Checking Globex pods",
+            "parameters": {"namespace": "tenant-globex"},
+        },
+    },
+    {
+        "id": "denied-no-human",
+        "label": "❌ Remediation scales without human trigger",
+        "description": "Autonomous agent calls resources_scale — no triggeredBy. Policy 3b blocks.",
+        "invocation": {
+            "agentId": "remediation-agent", "toolName": "resources_scale",
+            "namespace": "tenant-acme", "tenantId": "tenant-acme",
+            "triggeredBy": "",
+            "reason": "Auto-scaling triggered by alert",
+            "parameters": {"apiVersion": "apps/v1", "kind": "Deployment",
+                          "name": "nginx", "namespace": "tenant-acme", "scale": 5},
+        },
+    },
+    {
+        "id": "allowed-remediation",
+        "label": "✅ Remediation scales with human approval",
+        "description": "Remediation agent scales with human context. All policies pass.",
+        "invocation": {
+            "agentId": "remediation-agent", "toolName": "resources_scale",
+            "namespace": "tenant-acme", "tenantId": "tenant-acme",
+            "triggeredBy": "bob@acme.com",
+            "reason": "Approved by on-call engineer Bob",
+            "parameters": {"apiVersion": "apps/v1", "kind": "Deployment",
+                          "name": "nginx", "namespace": "tenant-acme", "scale": 3},
+        },
+    },
+    {
+        "id": "allowed-cost-resources",
+        "label": "✅ Cost agent reads resource usage",
+        "description": "Cost agent lists resources for rightsizing. All policies pass.",
+        "invocation": {
+            "agentId": "cost-agent", "toolName": "resources_list",
+            "namespace": "tenant-acme", "tenantId": "tenant-acme",
+            "triggeredBy": "carol@acme.com",
+            "reason": "Weekly rightsizing analysis",
+            "parameters": {"apiVersion": "apps/v1", "kind": "Deployment",
+                          "namespace": "tenant-acme"},
+        },
+    },
+]
 
-def evaluate_policies(invocation: dict) -> dict:
+# ── Real proxy call ────────────────────────────────────────────────────────────
+
+def call_real_proxy(invocation: dict) -> dict:
     """
-    Simulates Kyverno ValidatingPolicy / MutatingPolicy evaluation.
-    Returns decision, policy_results, and audit annotations.
+    Makes a real MCP tool call through the authz-proxy.
+    Returns structured result matching the UI format.
     """
-    agent_id     = invocation.get("agentId", "")
     tool_name    = invocation.get("toolName", "")
-    tenant_id    = invocation.get("tenantId", "")
-    namespace    = invocation.get("namespace", "")
-    triggered_by = invocation.get("triggeredBy", "").strip()
+    agent_id     = invocation.get("agentId", "sre-agent")
+    triggered_by = invocation.get("triggeredBy", "")
+    namespace    = invocation.get("namespace", TENANT_ID)
+    tenant_id    = invocation.get("tenantId", TENANT_ID)
+    arguments    = invocation.get("parameters", {})
+
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": tool_name,
+            "arguments": arguments,
+        },
+    }
+    headers = {
+        "Content-Type":   "application/json",
+        "x-agent-id":     agent_id,
+        "x-triggered-by": triggered_by,
+        "x-reason":       invocation.get("reason", ""),
+        "x-tenant-id":    tenant_id,    # explicit tenant — enables cross-tenant detection
+    }
+
+    try:
+        resp = req.post(
+            f"{PROXY_URL}/mcp",
+            json=payload,
+            headers=headers,
+            timeout=10,
+        )
+        result = resp.json() if resp.content else {}
+    except req.exceptions.ConnectionError:
+        return _proxy_unavailable_result(invocation)
+    except Exception as e:
+        return _proxy_unavailable_result(invocation, str(e))
+
+    # ── Parse real response ────────────────────────────────────────────────────
+    is_denied = "error" in result
+    error_msg = ""
+    if is_denied:
+        err = result.get("error", {})
+        error_msg = err.get("message", "") if isinstance(err, dict) else str(err)
+
+    decision = "DENIED" if is_denied else "ALLOWED"
+
+    # Build per-policy results from real Kyverno response
+    policy_results = _build_policy_results(
+        decision, error_msg, tool_name, agent_id, tenant_id, namespace, triggered_by
+    )
+
+    # Get real annotations from K8s if admitted
+    audit_annotations = {}
+    if not is_denied and K8S_AVAILABLE:
+        audit_annotations = _get_latest_annotations()
+
+    return {
+        "decision":         decision,
+        "policy_results":   policy_results,
+        "failed_count":     len([r for r in policy_results if r["result"] == "FAIL"]) if decision == "DENIED" else 0,
+        "pass_count":       len([r for r in policy_results if r["result"] == "PASS"]),
+        "audit_annotations": audit_annotations,
+        "real_mode":        True,
+        "proxy_response":   result,
+        "invocation":       invocation,
+        "timestamp":        datetime.datetime.utcnow().isoformat() + "Z",
+    }
+
+
+def _build_policy_results(
+    decision, error_msg, tool_name, agent_id, tenant_id, namespace, triggered_by
+) -> list:
+    """
+    Build per-policy result cards from real Kyverno response only.
+    No duplicate policy logic — Kyverno is the single source of truth.
+
+    On DENY  — show the policy Kyverno reported as failing.
+               Show others as PASS (they were evaluated before the failure).
+    On ALLOW — all validating policies passed, mutating policy injected.
+    """
+    # Extract which policy Kyverno reported and its human-readable message
+    kyverno_failed = None
+    kyverno_msg    = ""
+
+    if decision == "DENIED" and error_msg:
+        for policy_name in [
+            "mcp-tool-allowlist",
+            "mcp-tenant-isolation",
+            "mcp-require-human-trigger",
+        ]:
+            if policy_name in error_msg:
+                kyverno_failed = policy_name
+                # Pull clean message after "failed:"
+                match = re.search(r"failed[:\s]+(.+?)(?:  |\n|$)", error_msg)
+                kyverno_msg = match.group(1).strip() if match else error_msg
+                break
+        if not kyverno_failed:
+            # Generic denial — unknown which policy
+            kyverno_msg = error_msg
+
+    def result_for(policy_name, rule, pass_msg, write_only=False):
+        """Return a policy result card."""
+        if write_only and tool_name not in WRITE_TOOLS:
+            return None
+        # Kyverno explicitly reported this policy as failing
+        if kyverno_failed == policy_name:
+            return {"policy": policy_name, "rule": rule, "result": "FAIL",
+                    "message": kyverno_msg}
+        # Kyverno denied but we couldn't identify which policy from the message
+        if decision == "DENIED" and not kyverno_failed:
+            return {"policy": policy_name, "rule": rule, "result": "FAIL",
+                    "message": kyverno_msg or "Denied by Kyverno — check proxy logs"}
+        # A different policy failed — this one was evaluated and passed
+        if kyverno_failed and kyverno_failed != policy_name:
+            return {"policy": policy_name, "rule": rule, "result": "PASS",
+                    "message": pass_msg}
+        # ALLOWED — all policies passed
+        return {"policy": policy_name, "rule": rule, "result": "PASS",
+                "message": pass_msg}
 
     results = []
 
-    # ── Policy 1: Tool Allowlist (spec.agentId based) ─────────────────────
-    agent = AGENTS.get(agent_id)
-    if agent:
-        if tool_name not in agent["allowed_tools"]:
-            results.append({
-                "policy": "mcp-tool-allowlist",
-                "rule":   f"{agent_id}-allowlist",
-                "result": "FAIL",
-                "message": (
-                    f"Agent '{agent_id}' is not permitted to invoke '{tool_name}'. "
-                    f"Allowed: {', '.join(agent['allowed_tools'])}"
-                ),
-            })
-        else:
-            results.append({
-                "policy": "mcp-tool-allowlist",
-                "rule":   f"{agent_id}-allowlist",
-                "result": "PASS",
-                "message": f"Tool '{tool_name}' is in the allowlist for '{agent_id}'",
-            })
-    else:
-        results.append({
-            "policy": "mcp-tool-allowlist",
-            "rule":   "unknown-agent",
-            "result": "FAIL",
-            "message": (
-                f"Unknown agent '{agent_id}' — not registered. "
-                "Permitted agents: sre-agent, cost-agent, remediation-agent"
-            ),
-        })
+    # Policy 1 — Tool Allowlist
+    r = result_for(
+        "mcp-tool-allowlist",
+        f"{agent_id}-allowlist",
+        f"Tool '{tool_name}' is permitted for '{agent_id}'",
+    )
+    if r: results.append(r)
 
-    # ── Policy 2: Tenant Isolation ────────────────────────────────────────
-    if not tenant_id:
-        results.append({
-            "policy": "mcp-tenant-isolation",
-            "rule":   "require-tenant-context",
-            "result": "FAIL",
-            "message": "MCPToolInvocation must include a non-empty tenantId in spec.",
-        })
-    elif tenant_id != namespace:
-        results.append({
-            "policy": "mcp-tenant-isolation",
-            "rule":   "block-cross-tenant-invocations",
-            "result": "FAIL",
-            "message": (
-                f"Cross-tenant invocation denied. "
-                f"Agent namespace '{namespace}' does not match tenantId '{tenant_id}'."
-            ),
-        })
-    else:
-        results.append({
-            "policy": "mcp-tenant-isolation",
-            "rule":   "block-cross-tenant-invocations",
-            "result": "PASS",
-            "message": f"Tenant context '{tenant_id}' matches namespace '{namespace}'",
-        })
+    # Policy 2 — Tenant Isolation
+    r = result_for(
+        "mcp-tenant-isolation",
+        "block-cross-tenant-invocations",
+        f"Tenant context matches — '{tenant_id}' ✓",
+    )
+    if r: results.append(r)
 
-    # ── Policy 3a: Human Identity Injection (mutating — always passes) ────
+    # Policy 3a — Human Identity Injection (always MUTATE)
     results.append({
-        "policy": "mcp-inject-human-identity",
-        "rule":   "inject-human-identity-annotations",
-        "result": "MUTATE",
+        "policy":  "mcp-inject-human-identity",
+        "rule":    "inject-human-identity-annotations",
+        "result":  "MUTATE",
         "message": (
             f"Injected: mcp.security.io/triggered-by={triggered_by or agent_id}, "
             f"mcp.security.io/triggered-at="
@@ -191,207 +344,56 @@ def evaluate_policies(invocation: dict) -> dict:
         ),
     })
 
-    # ── Policy 3b: Require Human Trigger for Write Tools ─────────────────
-    if tool_name in WRITE_TOOLS:
-        if not triggered_by:
-            results.append({
-                "policy": "mcp-require-human-trigger",
-                "rule":   "require-human-trigger-for-write-tools",
-                "result": "FAIL",
-                "message": (
-                    f"Write-capable tool '{tool_name}' requires a human triggeredBy field. "
-                    "Automated invocations without explicit human context are denied."
-                ),
-            })
-        else:
-            results.append({
-                "policy": "mcp-require-human-trigger",
-                "rule":   "require-human-trigger-for-write-tools",
-                "result": "PASS",
-                "message": f"Human trigger '{triggered_by}' present for write tool '{tool_name}'",
-            })
+    # Policy 3b — Human Trigger (write tools only)
+    r = result_for(
+        "mcp-require-human-trigger",
+        "require-human-trigger-for-write-tools",
+        f"Human trigger '{triggered_by}' present for write tool '{tool_name}'",
+        write_only=True,
+    )
+    if r: results.append(r)
 
-    # ── Final decision ────────────────────────────────────────────────────
-    failed   = [r for r in results if r["result"] == "FAIL"]
-    decision = "DENIED" if failed else "ALLOWED"
-
-    return {
-        "decision":        decision,
-        "policy_results":  results,
-        "failed_count":    len(failed),
-        "pass_count":      len([r for r in results if r["result"] == "PASS"]),
-        "audit_annotations": {
-            "mcp.security.io/triggered-by":    triggered_by or agent_id,
-            "mcp.security.io/triggered-at":    datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "mcp.security.io/agent-id":        agent_id,
-            "mcp.security.io/tenant-id":       tenant_id,
-            "mcp.security.io/policy-version":  "v1",
-            "mcp.security.io/decision":        decision,
-        },
-    }
+    return results
 
 
-def try_kubectl_apply(invocation: dict) -> dict:
-    """
-    Attempts to apply MCPToolInvocation to the real cluster via kubectl.
-    Falls back to simulated evaluation if kubectl unavailable.
-    """
-    manifest = {
-        "apiVersion": "mcp.security.io/v1alpha1",
-        "kind":       "MCPToolInvocation",
-        "metadata": {
-            "generateName": "demo-",
-            "namespace":    invocation.get("namespace", "tenant-acme"),
-        },
-        "spec": {
-            "toolName":    invocation.get("toolName"),
-            "agentId":     invocation.get("agentId"),
-            "tenantId":    invocation.get("tenantId"),
-            "triggeredBy": invocation.get("triggeredBy", ""),
-            "reason":      invocation.get("reason", ""),
-            "parameters":  invocation.get("parameters", {}),
-        },
-    }
+def _get_latest_annotations() -> dict:
+    """Fetch annotations from the latest MCPToolInvocation CR in the cluster."""
     try:
-        result = subprocess.run(
-            ["kubectl", "apply", "-f", "-"],
-            input=yaml.dump(manifest),
-            capture_output=True,
-            text=True,
-            timeout=5,
+        custom_api = client.CustomObjectsApi()
+        crs = custom_api.list_namespaced_custom_object(
+            group=MCP_GROUP, version=MCP_VERSION,
+            namespace=TENANT_ID, plural=MCP_PLURAL,
         )
-        return {
-            "kubectl_available": True,
-            "stdout":     result.stdout,
-            "stderr":     result.stderr,
-            "returncode": result.returncode,
-        }
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return {"kubectl_available": False}
+        items = crs.get("items", [])
+        if not items:
+            return {}
+        # Sort by creationTimestamp, get latest
+        latest = sorted(
+            items,
+            key=lambda x: x.get("metadata", {}).get("creationTimestamp", ""),
+        )[-1]
+        annotations = latest.get("metadata", {}).get("annotations", {})
+        # Return only mcp.security.io annotations
+        return {k: v for k, v in annotations.items() if "mcp.security.io" in k}
+    except Exception:
+        return {}
 
 
-# ──────────────────────────────────────────────
-# Predefined demo scenarios
-# Tool names match real kubernetes-mcp-server
-# ──────────────────────────────────────────────
+def _proxy_unavailable_result(invocation: dict, error: str = "") -> dict:
+    """Fallback result when proxy is not reachable."""
+    return {
+        "decision":         "ERROR",
+        "policy_results":   [],
+        "failed_count":     0,
+        "pass_count":       0,
+        "audit_annotations": {},
+        "real_mode":        False,
+        "error":            f"Cannot connect to authz-proxy at {PROXY_URL}. {error}".strip(),
+        "invocation":       invocation,
+        "timestamp":        datetime.datetime.utcnow().isoformat() + "Z",
+    }
 
-SCENARIOS = [
-    {
-        "id":          "allowed-sre-pods",
-        "label":       "✅ SRE lists pods in own namespace (allowed)",
-        "description": "SRE agent lists pods within its own tenant namespace. All policies pass.",
-        "invocation": {
-            "agentId":     "sre-agent",
-            "toolName":    "pods_list_in_namespace",
-            "namespace":   "tenant-acme",
-            "tenantId":    "tenant-acme",
-            "triggeredBy": "alice@acme.com",
-            "reason":      "Checking pod status during incident investigation",
-            "parameters":  {"namespace": "tenant-acme"},
-        },
-    },
-    {
-        "id":          "denied-tool-allowlist",
-        "label":       "❌ SRE tries to scale deployment (not in allowlist)",
-        "description": "SRE agent attempts resources_scale — outside its allowlist. Policy 1 blocks.",
-        "invocation": {
-            "agentId":     "sre-agent",
-            "toolName":    "resources_scale",
-            "namespace":   "tenant-acme",
-            "tenantId":    "tenant-acme",
-            "triggeredBy": "alice@acme.com",
-            "reason":      "Trying to scale after seeing high latency",
-            "parameters":  {
-                "apiVersion": "apps/v1",
-                "kind":       "Deployment",
-                "name":       "checkout",
-                "namespace":  "tenant-acme",
-                "replicas":   5,
-            },
-        },
-    },
-    {
-        "id":          "denied-cross-tenant",
-        "label":       "❌ SRE crosses tenant boundary (cross-tenant blocked)",
-        "description": "SRE agent in tenant-acme tries to list pods in tenant-globex. Policy 2 blocks.",
-        "invocation": {
-            "agentId":     "sre-agent",
-            "toolName":    "pods_list_in_namespace",
-            "namespace":   "tenant-acme",
-            "tenantId":    "tenant-globex",
-            "triggeredBy": "alice@acme.com",
-            "reason":      "Checking Globex pods out of curiosity",
-            "parameters":  {"namespace": "tenant-globex"},
-        },
-    },
-    {
-        "id":          "denied-no-human",
-        "label":       "❌ Remediation deletes pod without human trigger",
-        "description": "Autonomous remediation fires pods_delete without a human triggeredBy. Policy 3b blocks.",
-        "invocation": {
-            "agentId":     "remediation-agent",
-            "toolName":    "pods_delete",
-            "namespace":   "tenant-acme",
-            "tenantId":    "tenant-acme",
-            "triggeredBy": "",
-            "reason":      "Auto-remediation triggered by alert rule",
-            "parameters":  {"name": "checkout-7d9b4c-xkp2n", "namespace": "tenant-acme"},
-        },
-    },
-    {
-        "id":          "allowed-remediation",
-        "label":       "✅ Remediation deletes pod with human approval",
-        "description": "Remediation agent deletes pod with human context. All policies pass.",
-        "invocation": {
-            "agentId":     "remediation-agent",
-            "toolName":    "pods_delete",
-            "namespace":   "tenant-acme",
-            "tenantId":    "tenant-acme",
-            "triggeredBy": "bob@acme.com",
-            "reason":      "Pod in CrashLoopBackOff, approved by on-call engineer Bob",
-            "parameters":  {"name": "checkout-7d9b4c-xkp2n", "namespace": "tenant-acme"},
-        },
-    },
-    {
-        "id":          "allowed-cost-resources",
-        "label":       "✅ Cost agent reads resource usage (allowed)",
-        "description": "Cost agent lists resources for rightsizing analysis. All policies pass.",
-        "invocation": {
-            "agentId":     "cost-agent",
-            "toolName":    "resources_list",
-            "namespace":   "tenant-acme",
-            "tenantId":    "tenant-acme",
-            "triggeredBy": "carol@acme.com",
-            "reason":      "Weekly rightsizing analysis",
-            "parameters":  {"apiVersion": "apps/v1", "kind": "Deployment", "namespace": "tenant-acme"},
-        },
-    },
-    {
-        "id":          "denied-cost-write",
-        "label":       "❌ Cost agent tries to scale (not in allowlist)",
-        "description": "Cost agent attempts resources_scale — outside its allowlist. Policy 1 blocks.",
-        "invocation": {
-            "agentId":     "cost-agent",
-            "toolName":    "resources_scale",
-            "namespace":   "tenant-acme",
-            "tenantId":    "tenant-acme",
-            "triggeredBy": "carol@acme.com",
-            "reason":      "Trying to right-size deployment directly",
-            "parameters":  {
-                "apiVersion": "apps/v1",
-                "kind":       "Deployment",
-                "name":       "checkout",
-                "namespace":  "tenant-acme",
-                "replicas":   2,
-            },
-        },
-    },
-]
-
-
-# ──────────────────────────────────────────────
-# Routes
-# ──────────────────────────────────────────────
+# ── Routes ──────────────────────────────────────────────────────────────────────
 
 @app.route("/")
 def index():
@@ -401,25 +403,16 @@ def index():
         tenants=TENANTS,
         all_tools=ALL_TOOLS,
         scenarios=SCENARIOS,
+        proxy_url=PROXY_URL,
     )
 
 
 @app.route("/api/invoke", methods=["POST"])
 def invoke_tool():
     data = request.get_json()
-
-    # Simulate admission latency for realism
-    time.sleep(0.3)
-
-    result       = evaluate_policies(data)
-    kubectl_result = try_kubectl_apply(data)
-
-    return jsonify({
-        **result,
-        "invocation": data,
-        "kubectl":    kubectl_result,
-        "timestamp":  datetime.datetime.utcnow().isoformat() + "Z",
-    })
+    time.sleep(0.2)
+    result = call_real_proxy(data)
+    return jsonify(result)
 
 
 @app.route("/api/scenario/<scenario_id>")
@@ -440,6 +433,95 @@ def get_tools():
     return jsonify(ALL_TOOLS)
 
 
+@app.route("/api/status")
+def get_status():
+    """Check if proxy and K8s are reachable."""
+    proxy_ok = False
+    try:
+        r = req.get(f"{PROXY_URL}/healthz", timeout=3)
+        proxy_ok = r.status_code == 200
+        proxy_info = r.json() if proxy_ok else {}
+    except Exception:
+        proxy_info = {}
+
+    k8s_ok = K8S_AVAILABLE
+    active_policies = []
+    live_invocations = []
+
+    if k8s_ok:
+        try:
+            custom_api = client.CustomObjectsApi()
+            crs = custom_api.list_namespaced_custom_object(
+                group=MCP_GROUP, version=MCP_VERSION,
+                namespace=TENANT_ID, plural=MCP_PLURAL,
+            )
+            items = crs.get("items", [])
+            for item in sorted(
+                items,
+                key=lambda x: x.get("metadata", {}).get("creationTimestamp", ""),
+                reverse=True,
+            )[:10]:
+                meta = item.get("metadata", {})
+                spec = item.get("spec", {})
+                annotations = {
+                    k: v for k, v in meta.get("annotations", {}).items()
+                    if "mcp.security.io" in k
+                }
+                live_invocations.append({
+                    "name":        meta.get("name"),
+                    "tool":        spec.get("toolName"),
+                    "agent":       spec.get("agentId"),
+                    "triggeredBy": spec.get("triggeredBy"),
+                    "time":        meta.get("creationTimestamp"),
+                    "annotations": annotations,
+                })
+        except Exception:
+            pass
+
+    return jsonify({
+        "proxy":             {"ok": proxy_ok, "url": PROXY_URL, **proxy_info},
+        "kubernetes":        {"ok": k8s_ok},
+        "live_invocations":  live_invocations,
+        "mode":              "real" if proxy_ok else "unavailable",
+    })
+
+
+@app.route("/api/live-invocations")
+def get_live_invocations():
+    """Return recent MCPToolInvocation CRs from the cluster."""
+    if not K8S_AVAILABLE:
+        return jsonify({"items": [], "k8s_available": False})
+    try:
+        custom_api = client.CustomObjectsApi()
+        crs = custom_api.list_namespaced_custom_object(
+            group=MCP_GROUP, version=MCP_VERSION,
+            namespace=TENANT_ID, plural=MCP_PLURAL,
+        )
+        items = []
+        for item in sorted(
+            crs.get("items", []),
+            key=lambda x: x.get("metadata", {}).get("creationTimestamp", ""),
+            reverse=True,
+        )[:20]:
+            meta = item.get("metadata", {})
+            spec = item.get("spec", {})
+            items.append({
+                "name":        meta.get("name"),
+                "tool":        spec.get("toolName"),
+                "agent":       spec.get("agentId"),
+                "tenant":      spec.get("tenantId"),
+                "triggeredBy": spec.get("triggeredBy"),
+                "time":        meta.get("creationTimestamp"),
+                "annotations": {
+                    k: v for k, v in meta.get("annotations", {}).items()
+                    if "mcp.security.io" in k
+                },
+            })
+        return jsonify({"items": items, "k8s_available": True})
+    except Exception as e:
+        return jsonify({"items": [], "error": str(e), "k8s_available": True})
+
+
 @app.route("/api/policies")
 def get_policies():
     policies_dir = os.path.join(os.path.dirname(__file__), "k8s", "policies")
@@ -455,4 +537,6 @@ def get_policies():
 if __name__ == "__main__":
     port  = int(os.environ.get("PORT", 5000))
     debug = os.environ.get("DEBUG", "true").lower() == "true"
+    print(f"Proxy URL: {PROXY_URL}")
+    print(f"K8s available: {K8S_AVAILABLE}")
     app.run(host="0.0.0.0", port=port, debug=debug)
